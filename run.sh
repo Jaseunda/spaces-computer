@@ -83,12 +83,17 @@ fi
 mkdir -p "$DATA_DIR"
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
+# The container runs UTC, so an agent asked for "today" writes yesterday's date
+# through an evening. macOS keeps the zone behind /etc/localtime.
+TIMEZONE="${COMPUTER_TZ:-$(basename "$(readlink /etc/localtime 2>/dev/null || echo UTC)")}"
+
 printf ":: starting %s\n" "$CONTAINER_NAME"
 docker run -d \
   --name "$CONTAINER_NAME" \
   --user 1000:1000 \
   --env "DISPLAY=:1" \
   --env "HOME=/home/computer" \
+  --env "TZ=${TIMEZONE}" \
   --env "PATH=/home/computer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   --env "COMPUTER_CONTROL_TOKEN=${TOKEN}" \
   -p "127.0.0.1:${CONTROL_PORT}:7070" \
