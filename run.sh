@@ -1,140 +1,180 @@
 #!/usr/bin/env bash
+# spaces computer launcher
+#
+# Runs the published desktop image, which brings up Xvfb at its RANDR ceiling,
+# x11vnc, websockify, the control server, picom and the agent theming itself.
+#
+# This used to apt-get a stock Debian and hand-start Xvfb + x11vnc + websockify,
+# which never launched the control server: the terminal printed "container daemon
+# online" while the advertised :7070 endpoint had nothing behind it, so a tunnel
+# in front of it answered 502. The image is now the only supported path, and
+# nothing is called online until the control server has actually answered.
 set -euo pipefail
 
-# terminal styling
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-GREEN=$'\033[32m'
-CYAN=$'\033[36m'
-YELLOW=$'\033[33m'
-RED=$'\033[31m'
-RESET=$'\033[0m'
-
-CONTAINER_NAME="${COMPUTER_CONTAINER:-spaces-computer-standalone}"
+IMAGE_NAME="${COMPUTER_IMAGE:-ghcr.io/jaseunda/spaces-computer:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-spaces-computer}"
 CONTROL_PORT="${COMPUTER_CONTROL_PORT:-7070}"
 NO_VNC_PORT="${COMPUTER_NO_VNC_PORT:-6080}"
 TOKEN="${COMPUTER_CONTROL_TOKEN:-}"
+ACCESS_MODE="${COMPUTER_ACCESS_MODE:-ask}"
 DATA_DIR="${COMPUTER_DATA_DIR:-$HOME/.spaces/computer-home}"
-IMAGE_NAME="debian:bookworm-slim"
+APP_URL="${SPACES_APP_URL:-https://spaces.notapublicfigureanymore.com}"
 
-# verify docker presence
+RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
+
 if ! command -v docker >/dev/null 2>&1; then
   printf "%s✗ docker not found in path%s\n" "$RED" "$RESET" >&2
-  printf "install docker to continue\n" >&2
   exit 1
 fi
 
-# interactive mode selection
-ACCESS_MODE=""
-if [ -n "${1:-}" ]; then
+while [ $# -gt 0 ]; do
   case "$1" in
     --tunnel) ACCESS_MODE="tunnel" ;;
     --local) ACCESS_MODE="local" ;;
+    --image) shift; IMAGE_NAME="${1:-}" ;;
+    *) printf "unknown option: %s\n" "$1" >&2; exit 2 ;;
   esac
-fi
+  shift
+done
 
-if [ -z "$ACCESS_MODE" ] && [ -t 0 ]; then
-  printf "\n%sspaces computer launcher%s\n\n" "$BOLD" "$RESET"
-  printf "select access mode:\n"
-  printf "  %s1%s) local only (127.0.0.1)\n" "$CYAN" "$RESET"
-  printf "  %s2%s) cloudflare tunnel (remote 1-click connect)\n\n" "$CYAN" "$RESET"
-  read -r -p "choice [1-2] (default: 1): " USER_CHOICE
-  case "$USER_CHOICE" in
-    2) ACCESS_MODE="tunnel" ;;
-    *) ACCESS_MODE="local" ;;
-  esac
-elif [ -z "$ACCESS_MODE" ]; then
-  # non-interactive pipe default
-  if [ "${TUNNEL:-0}" = "1" ]; then
-    ACCESS_MODE="tunnel"
+if [ "$ACCESS_MODE" = "ask" ]; then
+  if [ -t 0 ]; then
+    printf "\n%sspaces computer launcher%s\n\n" "$BOLD" "$RESET"
+    printf "select access mode:\n  1) local only (127.0.0.1)\n  2) cloudflare tunnel (remote 1-click connect)\n\n"
+    read -r -p "choice [1]: " REPLY || REPLY=""
+    if [ "${REPLY:-1}" = "2" ]; then ACCESS_MODE="tunnel"; else ACCESS_MODE="local"; fi
   else
     ACCESS_MODE="local"
   fi
 fi
 
+# `tr | head` trips pipefail: head closes the pipe and tr dies on SIGPIPE.
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(openssl rand -hex 12 2>/dev/null || printf 'spaces-%s' "$(date +%s)")"
+fi
+
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  printf ":: pulling %s\n" "$IMAGE_NAME"
+  if ! docker pull "$IMAGE_NAME" >/dev/null 2>&1; then
+    BUILD_DIR=""
+    for candidate in "${COMPUTER_BUILD_DIR:-}" ./computer ../Base2/computer ../app/computer; do
+      if [ -n "$candidate" ] && [ -f "$candidate/Dockerfile" ]; then BUILD_DIR="$candidate"; break; fi
+    done
+    if [ -z "$BUILD_DIR" ]; then
+      printf "%s✗ no image %s and no computer/ directory to build one from%s\n" "$RED" "$IMAGE_NAME" "$RESET" >&2
+      printf "  run (cd <spaces app> && npm run build:image) and tag it, or pass --image\n" >&2
+      exit 1
+    fi
+    printf ":: building %s from %s\n" "$IMAGE_NAME" "$BUILD_DIR"
+    docker build -t "$IMAGE_NAME" "$BUILD_DIR" >/dev/null
+  fi
+fi
+
+# The compose stack uses its own container name on the same two ports; running
+# both produces a networking error that says nothing about the real cause.
+if { [ "$CONTROL_PORT" = "7070" ] || [ "$NO_VNC_PORT" = "6080" ]; } \
+  && [ "$CONTAINER_NAME" != "spaces-computer-standalone" ] \
+  && docker ps --format '{{.Names}}' | grep -qx 'spaces-computer-standalone'; then
+  printf "%s✗ spaces-computer-standalone is already running on 7070 and 6080%s\n" "$RED" "$RESET" >&2
+  printf "  docker compose down, or set CONTAINER_NAME and the COMPUTER_*_PORT overrides\n" >&2
+  exit 1
+fi
+
 mkdir -p "$DATA_DIR"
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-# clear stale containers
-if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-fi
-
-for OCCUPIER in $(docker ps -q --filter "publish=${CONTROL_PORT}" --filter "publish=${NO_VNC_PORT}"); do
-  docker rm -f "$OCCUPIER" >/dev/null 2>&1 || true
-done
-docker rm -f base-computer >/dev/null 2>&1 || true
-
-# generate random token
-if [ -z "${TOKEN}" ]; then
-  TOKEN="$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 24 || echo "spaces-$(date +%s)")"
-fi
-
-printf ":: preparing stock linux container\n"
-docker pull "$IMAGE_NAME" >/dev/null 2>&1
-
+printf ":: starting %s\n" "$CONTAINER_NAME"
 docker run -d \
   --name "$CONTAINER_NAME" \
-  --restart unless-stopped \
+  --user 1000:1000 \
+  --env "DISPLAY=:1" \
+  --env "HOME=/home/computer" \
+  --env "PATH=/home/computer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --env "COMPUTER_CONTROL_TOKEN=${TOKEN}" \
   -p "127.0.0.1:${CONTROL_PORT}:7070" \
   -p "127.0.0.1:${NO_VNC_PORT}:6080" \
-  --env DISPLAY=:1 \
-  --env "COMPUTER_CONTROL_TOKEN=${TOKEN}" \
-  --shm-size 512m \
-  --cap-add SYS_ADMIN \
-  --security-opt seccomp=unconfined \
+  --memory 2g --memory-swap 2g --cpus 1.5 --shm-size 512m \
+  --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
   -v "${DATA_DIR}:/home/computer" \
-  "$IMAGE_NAME" sleep infinity >/dev/null
+  "$IMAGE_NAME" >/dev/null
 
-printf ":: installing desktop environment\n"
-docker exec -i "$CONTAINER_NAME" bash << 'BOOTSTRAP' >/dev/null 2>&1
-set -e
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
-  xvfb x11vnc fluxbox novnc websockify python3 procps curl ca-certificates xdotool wmctrl xterm
-mkdir -p /home/computer /tmp/.X11-unix
-Xvfb :1 -screen 0 1280x800x24 -ac +extension RANDR +render -noreset >/tmp/xvfb.log 2>&1 &
-sleep 1
-fluxbox >/tmp/fluxbox.log 2>&1 &
-x11vnc -display :1 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-websockify --web /usr/share/novnc 6080 127.0.0.1:5900 >/tmp/novnc.log 2>&1 &
-BOOTSTRAP
+# The control server binds before Xvfb, the theme and fluxbox are up, so a port
+# that answers is not enough: wait for a window manager to own the root window
+# and then probe the desktop endpoint.
+printf ":: waiting for the desktop\n"
+DEADLINE=$((SECONDS + 90))
+until docker exec "$CONTAINER_NAME" env DISPLAY=:1 xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q '0x' \
+  && curl -fsS --max-time 4 -X POST "http://127.0.0.1:${CONTROL_PORT}/v1/desktop" \
+       -H "authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+       -d '{"display":":1","steps":[],"observe":false}' >/dev/null 2>&1; do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)" != "true" ]; then
+    printf "%s✗ the container exited%s\n" "$RED" "$RESET" >&2
+    docker logs --tail 40 "$CONTAINER_NAME" >&2 || true
+    exit 1
+  fi
+  if [ "$SECONDS" -gt "$DEADLINE" ]; then
+    printf "%s✗ the control server never answered on %s%s\n" "$RED" "$CONTROL_PORT" "$RESET" >&2
+    docker logs --tail 40 "$CONTAINER_NAME" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
 
 printf "%s✓%s container daemon online\n\n" "$GREEN" "$RESET"
 printf "%sconfiguration%s\n" "$BOLD" "$RESET"
 printf "  control endpoint : %shttp://127.0.0.1:%s%s\n" "$CYAN" "$CONTROL_PORT" "$RESET"
-printf "  screen endpoint  : %shttp://127.0.0.1:%s/vnc.html%s\n" "$CYAN" "$NO_VNC_PORT" "$RESET"
+printf "  screen endpoint  : %shttp://127.0.0.1:%s/embed.html%s\n" "$CYAN" "$NO_VNC_PORT" "$RESET"
 printf "  bearer token     : %s%s%s\n\n" "$YELLOW" "$TOKEN" "$RESET"
 
-# launch cloudflare tunnel if requested
-if [ "$ACCESS_MODE" = "tunnel" ]; then
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    printf "%s!%s cloudflared not installed, skipping tunnel\n" "$YELLOW" "$RESET"
-    exit 0
-  fi
-
-  printf ":: starting cloudflare tunnels\n"
-  cloudflared tunnel --url "http://127.0.0.1:${NO_VNC_PORT}" > /tmp/spaces-tunnel-screen.log 2>&1 &
-  SCREEN_TUNNEL_PID=$!
-  cloudflared tunnel --url "http://127.0.0.1:${CONTROL_PORT}" > /tmp/spaces-tunnel-control.log 2>&1 &
-  CONTROL_TUNNEL_PID=$!
-  
-  for _ in $(seq 1 40); do
-    SCREEN_URL=$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-screen.log | head -n 1 || true)
-    CONTROL_URL=$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-control.log | head -n 1 || true)
-    if [ -n "$SCREEN_URL" ] && [ -n "$CONTROL_URL" ]; then
-      break
-    fi
-    sleep 0.5
-  done
-
-  JSON_PAYLOAD=$(python3 -c "import json, base64; print(base64.b64encode(json.dumps({'c': '$CONTROL_URL', 's': '$SCREEN_URL/vnc.html', 't': '$TOKEN'}).encode()).decode())")
-  CONNECT_URL="https://spaces.notapublicfigureanymore.com/?connect=${JSON_PAYLOAD}"
-
-  printf "%s✓%s tunnels active\n\n" "$GREEN" "$RESET"
-  printf "%sremote connection%s\n" "$BOLD" "$RESET"
-  printf "  1-click url : %s%s%s\n" "$GREEN" "$CONNECT_URL" "$RESET"
-  printf "  connect key : %s%s%s\n\n" "$DIM" "$JSON_PAYLOAD" "$RESET"
-  printf "%spress ctrl+c to exit%s\n" "$DIM" "$RESET"
-  wait "$CONTROL_TUNNEL_PID" 2>/dev/null || true
+if [ "$ACCESS_MODE" != "tunnel" ]; then
+  printf "%slocal only%s: open the app on this machine and choose the local daemon.\n" "$DIM" "$RESET"
+  printf "logs: docker logs -f %s\n" "$CONTAINER_NAME"
+  exit 0
 fi
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+  printf "%s!%s cloudflared not installed, staying local only\n" "$YELLOW" "$RESET" >&2
+  printf "  brew install cloudflared, then run this again with --tunnel\n" >&2
+  exit 1
+fi
+
+printf ":: starting cloudflare tunnels\n"
+cloudflared tunnel --url "http://127.0.0.1:${NO_VNC_PORT}" >/tmp/spaces-tunnel-screen.log 2>&1 &
+SCREEN_PID=$!
+cloudflared tunnel --url "http://127.0.0.1:${CONTROL_PORT}" >/tmp/spaces-tunnel-control.log 2>&1 &
+CONTROL_PID=$!
+trap 'kill "$SCREEN_PID" "$CONTROL_PID" 2>/dev/null || true' EXIT
+
+SCREEN_URL=""
+CONTROL_URL=""
+DEADLINE=$((SECONDS + 60))
+while [ -z "$SCREEN_URL" ] || [ -z "$CONTROL_URL" ]; do
+  SCREEN_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-screen.log | head -n 1 || true)"
+  CONTROL_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-control.log | head -n 1 || true)"
+  if [ "$SECONDS" -gt "$DEADLINE" ]; then
+    printf "%s✗ tunnels never published a URL%s\n" "$RED" "$RESET" >&2
+    tail -20 /tmp/spaces-tunnel-control.log >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+# Hand over a key only once the daemon answers through the tunnel, so a 502 can
+# never be reported as connected.
+if ! curl -fsS --max-time 25 -X POST "${CONTROL_URL}/v1/desktop" \
+    -H "authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+    -d '{"display":":1","steps":[],"observe":false}' >/dev/null; then
+  printf "%s✗ the tunnel is up but the daemon is unreachable through it%s\n" "$RED" "$RESET" >&2
+  printf "  %s answered %s\n" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/v1/desktop" || true)" >&2
+  exit 1
+fi
+
+CONNECT_KEY="$(python3 -c 'import json, base64, sys; print(base64.b64encode(json.dumps({"c": sys.argv[1], "s": sys.argv[2], "t": sys.argv[3]}).encode()).decode())' "$CONTROL_URL" "${SCREEN_URL}/embed.html" "$TOKEN")"
+
+printf "\n%s✓%s tunnels active\n\n" "$GREEN" "$RESET"
+printf "%sremote connection%s\n" "$BOLD" "$RESET"
+printf "  1-click url : %s%s/?connect=%s%s\n" "$GREEN" "$APP_URL" "$CONNECT_KEY" "$RESET"
+printf "  connect key : %s%s%s\n\n" "$DIM" "$CONNECT_KEY" "$RESET"
+printf "%skeep this terminal open: the tunnels and this key die with it%s\n" "$DIM" "$RESET"
+
+wait
