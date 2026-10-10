@@ -17,6 +17,7 @@ TOKEN_FILE="$DATA_DIR/.spaces/token"
 CONTROL="http://127.0.0.1:$CONTROL_PORT"
 SCREEN="http://127.0.0.1:$NO_VNC_PORT"
 LAUNCHER="$HOME/.spaces/run.sh"
+LAUNCHER_URL="https://raw.githubusercontent.com/Jaseunda/spaces-computer/main/run.sh"
 
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
 fails=0; warns=0
@@ -27,6 +28,48 @@ bad()  { printf "  %s✗ %s%s\n" "$RED" "$1" "$RESET"; [ -n "${2:-}" ] && printf
 note() { printf "  %s·%s %s\n" "$DIM" "$RESET" "$1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# The launcher is the only thing that can create the container, so always fetch
+# a fresh copy: every confusing bug here has been someone running an old run.sh.
+ensure_launcher() {
+  mkdir -p "$HOME/.spaces"
+  printf ":: fetching the launcher\n"
+  if curl -fsSL --max-time 30 "$LAUNCHER_URL" -o "$LAUNCHER.tmp"; then
+    mv "$LAUNCHER.tmp" "$LAUNCHER"
+    return 0
+  fi
+  rm -f "$LAUNCHER.tmp"
+  # No network for GitHub? ghcr is unreachable too, so a cached launcher can
+  # still boot an image we already have.
+  [ -f "$LAUNCHER" ] || return 1
+  warn "could not reach the launcher source, using the cached copy"
+}
+
+cmd_start() {
+  if ! have docker || ! docker info >/dev/null 2>&1; then
+    bad "docker is not available" "start Docker or colima first, then try again"
+    return 1
+  fi
+  ensure_launcher || { bad "could not fetch the launcher" "check your connection"; return 1; }
+  bash "$LAUNCHER" "$@"
+}
+
+cmd_stop() {
+  local id; id="$(container_id)"
+  [ -n "$id" ] || { note "no $CONTAINER_NAME container"; return 0; }
+  docker stop "$id" >/dev/null && ok "stopped $CONTAINER_NAME (your files and key are kept)"
+}
+
+cmd_restart() {
+  local id; id="$(container_id)"
+  if [ -z "$id" ]; then cmd_start "$@"; return; fi
+  if docker start "$id" >/dev/null 2>&1; then
+    ok "restarted $CONTAINER_NAME"
+    note "this keeps the image it was created from - run 'spaces update' for a newer one"
+  else
+    bad "the container would not start" "docker logs --tail 40 $CONTAINER_NAME"
+  fi
+}
 
 container_id() { docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.ID}}' 2>/dev/null | head -1; }
 
@@ -241,14 +284,9 @@ cmd_update() {
     return 0
   fi
   printf ":: image changed sha256:%s -> sha256:%s\n" "$before" "$after"
-  if [ ! -f "$LAUNCHER" ]; then
-    printf ":: fetching the launcher to %s\n" "$LAUNCHER"
-    mkdir -p "$HOME/.spaces"
-    if ! curl -fsSL --max-time 30 \
-        "https://raw.githubusercontent.com/Jaseunda/spaces-computer/main/run.sh" -o "$LAUNCHER"; then
-      bad "could not fetch the launcher" "paste the curl one-liner from the README once, and it stays here"
-      return 1
-    fi
+  if ! ensure_launcher; then
+    bad "could not fetch the launcher" "check your connection, or paste the curl one-liner from the README"
+    return 1
   fi
   printf ":: recreating the computer with the new image (your key and files are kept)\n"
   bash "$LAUNCHER" "$@"
@@ -268,6 +306,9 @@ cmd_help() {
   cat <<EOF
 spaces - inspect, verify and update a Spaces computer
 
+  spaces start     install and run the computer (passes --tunnel and friends on)
+  spaces stop      stop the computer, keeping its files and key
+  spaces restart   start the existing container again
   spaces doctor    check every moving part and say how to fix what fails
   spaces status    what is actually applied: image digest, key fingerprint, ports
   spaces update    pull the published image and recreate the computer if it changed
@@ -278,6 +319,9 @@ EOF
 }
 
 case "${1:-help}" in
+  start|run|install) shift; cmd_start "$@" ;;
+  stop)    cmd_stop ;;
+  restart) shift; cmd_restart "$@" ;;
   doctor)  cmd_doctor ;;
   status)  cmd_status ;;
   update)  shift; cmd_update "$@" ;;
