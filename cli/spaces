@@ -300,15 +300,22 @@ cmd_update() {
 }
 
 cmd_link() {
-  local url="" code f
-  # The launcher writes one log per run, so take the newest run that published.
+  local url="" code="" f looked=0
+  # The newest log by mtime is not the live tunnel: a retired cloudflared keeps
+  # writing heartbeats into its own file, so its dead hostname looks fresher than
+  # the one actually running. Ask each candidate who it is before reporting it.
   for f in $(ls -t /tmp/spaces-tunnel-control*.log 2>/dev/null); do
     url="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$f" | tail -1)"
-    [ -n "$url" ] && break
+    [ -n "$url" ] || continue
+    looked=$((looked + 1))
+    if curl -fsS --max-time 10 "$url/health" 2>/dev/null | grep -q spaces-computer-control; then
+      code="answers as control"
+      break
+    fi
+    url=""
   done
-  [ -n "$url" ] || { bad "no control tunnel on this machine" "run the launcher with --tunnel"; return 1; }
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url/health")"
-  printf "control tunnel: %s (health %s)\n" "$url" "$code"
+  [ -n "$url" ] || { bad "no control tunnel answers as control" "run the launcher again with --tunnel (${looked} log(s) looked dead)"; return 1; }
+  printf "control tunnel: %s (%s)\n" "$url" "$code"
   printf "key:            %s\n" "$(fingerprint "$(container_token 2>/dev/null)")"
   printf "mcp:            %s/mcp\n" "$url"
 }
