@@ -48,9 +48,20 @@ if [ "$ACCESS_MODE" = "ask" ]; then
   fi
 fi
 
+# The key lives in the mounted home volume, not in the container: every run
+# recreates the container, and a fresh key silently invalidates the connect link
+# already pasted into the browser - which then reads as "shell is down, 401".
 # `tr | head` trips pipefail: head closes the pipe and tr dies on SIGPIPE.
+TOKEN_FILE="$DATA_DIR/.spaces/token"
+if [ -z "$TOKEN" ] && [ -s "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\n' < "$TOKEN_FILE")"
+  printf ":: reusing the key from %s\n" "$TOKEN_FILE"
+fi
 if [ -z "$TOKEN" ]; then
   TOKEN="$(openssl rand -hex 12 2>/dev/null || printf 'spaces-%s' "$(date +%s)")"
+  mkdir -p "$DATA_DIR/.spaces"
+  printf '%s' "$TOKEN" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 fi
 
 if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
