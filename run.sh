@@ -190,35 +190,34 @@ while [ -z "$SCREEN_URL" ] || [ -z "$CONTROL_URL" ]; do
   sleep 1
 done
 
-# Hand over a key only once the daemon answers through the tunnel, so a 502 can
-# never be reported as connected.
-if ! curl -fsS --max-time 25 -X POST "${CONTROL_URL}/v1/desktop" \
-    -H "authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
-    -d '{"display":":1","steps":[],"observe":false}' >/dev/null; then
-  printf "%s✗ the tunnel is up but the daemon is unreachable through it%s\n" "$RED" "$RESET" >&2
-  printf "  %s answered %s\n" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/v1/desktop" || true)" >&2
-  exit 1
-fi
-
-# Both halves are handed over as one credential, so verify the screen too rather
-# than letting a link out with a control URL that answers on the noVNC port.
-if ! curl -fsS --max-time 25 "${SCREEN_URL}/embed.html" >/dev/null; then
-  printf "%s✗ the screen tunnel is up but noVNC did not answer at %s/embed.html%s\n" "$RED" "$SCREEN_URL" "$RESET" >&2
-  exit 1
-fi
-
-# Ask the control server who it is before handing anything over. A link whose
-# two halves were swapped looks exactly like a bad key to whoever pastes it, and
-# the two need opposite fixes.
+# Both halves are one credential, so hand over nothing until each of them answers
+# as what it claims. A quick tunnel's hostname also needs a few seconds to appear
+# in DNS and a few more before the connector carries traffic: probing once the
+# instant the URL is published fails with 000 on a tunnel that is fine, which is
+# the "daemon is unreachable" report from a new install.
 if [ "$CONTROL_URL" = "$SCREEN_URL" ]; then
   printf "%s✗ both tunnels published the same address, refusing to print a link%s\n" "$RED" "$RESET" >&2
   exit 1
 fi
-if ! curl -fsS --max-time 15 "$CONTROL_URL/health" | grep -q spaces-computer-control; then
-  printf "%s✗ %s is not answering as the control server (it answered %s)%s\n" "$RED" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/health" || true)" "$RESET" >&2
-  printf "  the screen tunnel answers the same way, so this link would only 401. Re-run this script.\n" >&2
-  exit 1
-fi
+
+DEADLINE=$((SECONDS + 90))
+while :; do
+  READY=1
+  curl -fsS --max-time 10 -X POST "${CONTROL_URL}/v1/desktop" \
+      -H "authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+      -d '{"display":":1","steps":[],"observe":false}' >/dev/null 2>&1 || READY=0
+  curl -fsS --max-time 10 "$CONTROL_URL/health" 2>/dev/null | grep -q spaces-computer-control || READY=0
+  curl -fsS --max-time 10 "${SCREEN_URL}/embed.html" >/dev/null 2>&1 || READY=0
+  [ "$READY" = "1" ] && break
+  if [ "$SECONDS" -gt "$DEADLINE" ]; then
+    printf "%s✗ the tunnels never answered as control and screen%s\n" "$RED" "$RESET" >&2
+    printf "  %s -> %s\n" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/health" || true)" "$RESET" >&2
+    printf "  %s -> %s\n" "$SCREEN_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SCREEN_URL/embed.html" || true)" "$RESET" >&2
+    printf "  the local daemon answers on port %s, so this is the tunnel: run it again\n" "$CONTROL_PORT" >&2
+    exit 1
+  fi
+  sleep 3
+done
 
 CONNECT_KEY="$(python3 -c 'import json, base64, sys; print(base64.b64encode(json.dumps({"c": sys.argv[1], "s": sys.argv[2], "t": sys.argv[3]}).encode()).decode())' "$CONTROL_URL" "${SCREEN_URL}/embed.html" "$TOKEN")"
 
