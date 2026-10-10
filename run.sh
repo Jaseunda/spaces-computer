@@ -53,7 +53,16 @@ if [ -z "$TOKEN" ]; then
   TOKEN="$(openssl rand -hex 12 2>/dev/null || printf 'spaces-%s' "$(date +%s)")"
 fi
 
-if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  # Having the image is not having the current one: without this a user who ran
+  # the launcher once kept their first build forever, however it changed.
+  printf ":: updating %s\n" "$IMAGE_NAME"
+  if docker pull "$IMAGE_NAME" >/dev/null 2>&1; then
+    printf "   %s%s%s\n" "$DIM" "$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME" | cut -c8-19)" "$RESET"
+  else
+    printf "%s! registry unreachable, continuing with the local copy%s\n" "$YELLOW" "$RESET" >&2
+  fi
+else
   printf ":: pulling %s\n" "$IMAGE_NAME"
   if ! docker pull "$IMAGE_NAME" >/dev/null 2>&1; then
     BUILD_DIR=""
