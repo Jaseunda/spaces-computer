@@ -242,9 +242,13 @@ cmd_update() {
   fi
   printf ":: image changed sha256:%s -> sha256:%s\n" "$before" "$after"
   if [ ! -f "$LAUNCHER" ]; then
-    printf "%s!%s no launcher at %s to recreate the container\n" "$YELLOW" "$RESET" "$LAUNCHER"
-    printf "  run it once and it is kept there, or paste the curl one-liner again\n"
-    return 1
+    printf ":: fetching the launcher to %s\n" "$LAUNCHER"
+    mkdir -p "$HOME/.spaces"
+    if ! curl -fsSL --max-time 30 \
+        "https://raw.githubusercontent.com/Jaseunda/spaces-computer/main/run.sh" -o "$LAUNCHER"; then
+      bad "could not fetch the launcher" "paste the curl one-liner from the README once, and it stays here"
+      return 1
+    fi
   fi
   printf ":: recreating the computer with the new image (your key and files are kept)\n"
   bash "$LAUNCHER" "$@"
