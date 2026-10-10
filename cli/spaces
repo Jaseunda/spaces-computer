@@ -279,11 +279,18 @@ cmd_update() {
     return 1
   fi
   after="$(local_digest)"
-  if [ "$before" = "$after" ]; then
+  running="$(running_digest)"
+  if [ "$before" = "$after" ] && [ "$running" = "$after" ]; then
     printf "%s✓ already current%s (sha256:%s)\n" "$GREEN" "$RESET" "$after"
     return 0
   fi
-  printf ":: image changed sha256:%s -> sha256:%s\n" "$before" "$after"
+  [ "$before" = "$after" ] || printf ":: image changed sha256:%s -> sha256:%s\n" "$before" "$after"
+  # A pull that changes nothing is not the same as an applied update: the running
+  # container keeps the image it was created from, so it can sit a dozen builds
+  # behind a local copy that reports "already current".
+  if [ -n "$running" ] && [ "$running" != "$after" ]; then
+    printf ":: the container is running sha256:%s while the image is sha256:%s, recreating it\n" "$running" "$after"
+  fi
   if ! ensure_launcher; then
     bad "could not fetch the launcher" "check your connection, or paste the curl one-liner from the README"
     return 1
@@ -293,8 +300,12 @@ cmd_update() {
 }
 
 cmd_link() {
-  local url code
-  url="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-control.log 2>/dev/null | tail -1)"
+  local url="" code f
+  # The launcher writes one log per run, so take the newest run that published.
+  for f in $(ls -t /tmp/spaces-tunnel-control*.log 2>/dev/null); do
+    url="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$f" | tail -1)"
+    [ -n "$url" ] && break
+  done
   [ -n "$url" ] || { bad "no control tunnel on this machine" "run the launcher with --tunnel"; return 1; }
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url/health")"
   printf "control tunnel: %s (health %s)\n" "$url" "$code"
