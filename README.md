@@ -19,8 +19,14 @@ running container rather than any config file, because those have disagreed in
 every confusing bug this project has had.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jaseunda/spaces-computer/main/cli/spaces -o /usr/local/bin/spaces
+curl -fsSL https://spaces.notapublicfigureanymore.com/install/cli.sh -o /usr/local/bin/spaces
 chmod +x /usr/local/bin/spaces
+```
+
+Or run it once without installing anything:
+
+```bash
+curl -fsSL https://spaces.notapublicfigureanymore.com/install/cli.sh | bash -s -- doctor
 ```
 
 | command | what it answers |
