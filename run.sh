@@ -144,9 +144,15 @@ if ! command -v cloudflared >/dev/null 2>&1; then
 fi
 
 printf ":: starting cloudflare tunnels\n"
-cloudflared tunnel --url "http://127.0.0.1:${NO_VNC_PORT}" >/tmp/spaces-tunnel-screen.log 2>&1 &
+# A shared log path is not safe: a cloudflared from an earlier run still holds
+# its file descriptor open and keeps writing into the truncated file, so the
+# first hostname in it can belong to a dead tunnel - or to the other port.
+RUN_TAG="$$.$(date +%s)"
+SCREEN_LOG="/tmp/spaces-tunnel-screen-${RUN_TAG}.log"
+CONTROL_LOG="/tmp/spaces-tunnel-control-${RUN_TAG}.log"
+cloudflared tunnel --url "http://127.0.0.1:${NO_VNC_PORT}" >"$SCREEN_LOG" 2>&1 &
 SCREEN_PID=$!
-cloudflared tunnel --url "http://127.0.0.1:${CONTROL_PORT}" >/tmp/spaces-tunnel-control.log 2>&1 &
+cloudflared tunnel --url "http://127.0.0.1:${CONTROL_PORT}" >"$CONTROL_LOG" 2>&1 &
 CONTROL_PID=$!
 trap 'kill "$SCREEN_PID" "$CONTROL_PID" 2>/dev/null || true' EXIT
 
@@ -154,11 +160,11 @@ SCREEN_URL=""
 CONTROL_URL=""
 DEADLINE=$((SECONDS + 60))
 while [ -z "$SCREEN_URL" ] || [ -z "$CONTROL_URL" ]; do
-  SCREEN_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-screen.log | head -n 1 || true)"
-  CONTROL_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-control.log | head -n 1 || true)"
+  SCREEN_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$SCREEN_LOG" | tail -n 1 || true)"
+  CONTROL_URL="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$CONTROL_LOG" | tail -n 1 || true)"
   if [ "$SECONDS" -gt "$DEADLINE" ]; then
     printf "%s✗ tunnels never published a URL%s\n" "$RED" "$RESET" >&2
-    tail -20 /tmp/spaces-tunnel-control.log >&2 || true
+    tail -20 "$CONTROL_LOG" >&2 || true
     exit 1
   fi
   sleep 1
@@ -171,6 +177,13 @@ if ! curl -fsS --max-time 25 -X POST "${CONTROL_URL}/v1/desktop" \
     -d '{"display":":1","steps":[],"observe":false}' >/dev/null; then
   printf "%s✗ the tunnel is up but the daemon is unreachable through it%s\n" "$RED" "$RESET" >&2
   printf "  %s answered %s\n" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/v1/desktop" || true)" >&2
+  exit 1
+fi
+
+# Both halves are handed over as one credential, so verify the screen too rather
+# than letting a link out with a control URL that answers on the noVNC port.
+if ! curl -fsS --max-time 25 "${SCREEN_URL}/embed.html" >/dev/null; then
+  printf "%s✗ the screen tunnel is up but noVNC did not answer at %s/embed.html%s\n" "$RED" "$SCREEN_URL" "$RESET" >&2
   exit 1
 fi
 
