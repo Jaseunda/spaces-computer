@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# spaces - inspect, verify and update a Spaces computer
+#
+# The launcher installs; this tells you what is actually running. Every answer
+# here is a fingerprint read from the machine - the image digest the container
+# was really created from, the key it really accepted - rather than what a file
+# or a pasted link claims, because those have disagreed in every confusing bug
+# this project has had.
+set -uo pipefail
+
+IMAGE_NAME="${COMPUTER_IMAGE:-ghcr.io/jaseunda/spaces-computer:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-spaces-computer}"
+CONTROL_PORT="${COMPUTER_CONTROL_PORT:-7070}"
+NO_VNC_PORT="${COMPUTER_NO_VNC_PORT:-6080}"
+DATA_DIR="${COMPUTER_DATA_DIR:-$HOME/.spaces/computer-home}"
+TOKEN_FILE="$DATA_DIR/.spaces/token"
+CONTROL="http://127.0.0.1:$CONTROL_PORT"
+SCREEN="http://127.0.0.1:$NO_VNC_PORT"
+LAUNCHER="$HOME/.spaces/run.sh"
+
+RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
+fails=0; warns=0
+
+ok()   { printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$1"; }
+warn() { printf "  %s!%s %s\n" "$YELLOW" "$RESET" "$1"; warns=$((warns + 1)); }
+bad()  { printf "  %s✗ %s%s\n" "$RED" "$1" "$RESET"; [ -n "${2:-}" ] && printf "    %srepair:%s %s\n" "$DIM" "$RESET" "$2"; fails=$((fails + 1)); }
+note() { printf "  %s·%s %s\n" "$DIM" "$RESET" "$1"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+container_id() { docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.ID}}' 2>/dev/null | head -1; }
+
+container_token() {
+  local id; id="$(container_id)"
+  [ -n "$id" ] || return 1
+  docker exec "$id" printenv COMPUTER_CONTROL_TOKEN 2>/dev/null
+}
+
+fingerprint() { printf '%s…%s' "${1:0:4}" "${1: -4}"; }
+
+# The digest the registry currently serves for the tag, without pulling it.
+registry_digest() {
+  have curl || return 1
+  local host="${IMAGE_NAME%%/*}"
+  local name="${IMAGE_NAME#*/}"; name="${name%:*}"
+  local tag="${IMAGE_NAME##*:}"
+  local tok
+  tok="$(curl -fsS --max-time 15 "https://$host/token?scope=repository:$name:pull" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  [ -n "$tok" ] || return 1
+  curl -fsS --max-time 15 -H "Authorization: Bearer $tok" \
+    -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+    -o /dev/null -D - "https://$host/v2/$name/manifests/$tag" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^docker-content-digest: *sha256:\([a-f0-9]\{12\}\).*/\1/p' | head -1
+}
+
+local_digest() { docker image inspect -f '{{.Id}}' "$IMAGE_NAME" 2>/dev/null | sed 's/^sha256://' | cut -c1-12; }
+
+running_digest() {
+  local id; id="$(container_id)"
+  [ -n "$id" ] || return 1
+  docker inspect -f '{{.Image}}' "$id" 2>/dev/null | sed 's/^sha256://' | cut -c1-12
+}
+
+check_docker() {
+  if ! have docker; then
+    bad "docker is not installed" "install Docker Desktop or colima, then re-run: curl -fsSL <launcher> | bash"
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    bad "the docker daemon is not running" "colima start   (or open Docker Desktop)"
+    return 1
+  fi
+  ok "docker daemon reachable"
+  return 0
+}
+
+check_container() {
+  local id; id="$(container_id)"
+  if [ -z "$id" ]; then
+    bad "no $CONTAINER_NAME container" "run the launcher:  curl -fsSL https://raw.githubusercontent.com/Jaseunda/spaces-computer/main/run.sh | bash -s -- --tunnel"
+    return 1
+  fi
+  local age image
+  age="$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null)"
+  image="$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null)"
+  ok "$CONTAINER_NAME is up (from $image)"
+  note "started $age"
+  return 0
+}
+
+check_control() {
+  local body
+  body="$(curl -fsS --max-time 8 "$CONTROL/health" 2>/dev/null)"
+  if [ -z "$body" ]; then
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$SCREEN/embed.html")" = "200" ] \
+      && [ "$CONTROL_PORT" = "$NO_VNC_PORT" ]; then
+      bad "$CONTROL is serving the screen, not the control API" "the ports are the same; check COMPUTER_CONTROL_PORT"
+    else
+      bad "nothing answers as the control server on $CONTROL" "docker logs --tail 40 $CONTAINER_NAME"
+    fi
+    return 1
+  fi
+  if printf '%s' "$body" | grep -q spaces-computer-control; then
+    ok "control server identified on :$CONTROL_PORT"
+  else
+    bad "$CONTROL answered but not as the control server: $body" "a websockify on this port means the container is the wrong build"
+    return 1
+  fi
+  return 0
+}
+
+check_key() {
+  local running stored
+  running="$(container_token 2>/dev/null)"
+  [ -n "$running" ] || { warn "cannot read the key from the container"; return 0; }
+  note "key the container accepts: $(fingerprint "$running")"
+  if [ -s "$TOKEN_FILE" ]; then
+    stored="$(tr -d '\n' < "$TOKEN_FILE")"
+    if [ "$stored" = "$running" ]; then
+      ok "the saved key matches the running container"
+    else
+      bad "the saved key ($(fingerprint "$stored")) is not what the container accepts" \
+        "your pasted connect link is stale: re-run the launcher and paste the new one"
+    fi
+  else
+    warn "no key file at $TOKEN_FILE (an older launcher); the next run will create it"
+  fi
+}
+
+check_screen() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$SCREEN/embed.html")"
+  if [ "$code" = "200" ]; then
+    ok "noVNC is serving the screen on :$NO_VNC_PORT"
+  else
+    bad "the screen endpoint answered $code" "docker exec $CONTAINER_NAME pgrep -af x11vnc websockify"
+  fi
+}
+
+check_image() {
+  local want got running
+  want="$(registry_digest)"
+  got="$(local_digest)"
+  running="$(running_digest)"
+  [ -n "$running" ] && note "running container: sha256:$running"
+  [ -n "$got" ] && note "local image:        sha256:$got"
+  if [ -z "$want" ]; then
+    warn "could not read the registry digest (offline, or the image is private)"
+    return 0
+  fi
+  note "registry $IMAGE_NAME: sha256:$want"
+  if [ -n "$running" ] && [ "$running" != "$want" ]; then
+    warn "the container is not running the published image"
+    printf "    %sspaces update%s pulls it and recreates the computer\n" "$CYAN" "$RESET"
+  elif [ -z "$running" ] && [ "$got" != "$want" ]; then
+    warn "a newer image is published than the one you have locally"
+  else
+    ok "the running computer is the published image"
+  fi
+}
+
+check_tunnels() {
+  local f name url code
+  for f in /tmp/spaces-tunnel-control.log /tmp/spaces-tunnel-screen.log; do
+    [ -s "$f" ] || continue
+    name="control"; case "$f" in *screen*) name="screen" ;; esac
+    url="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$f" | tail -1)"
+    [ -n "$url" ] || { warn "$name tunnel log has no address ($f)"; continue; }
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url/health")"
+    if [ "$name" = "control" ] && printf '%s' "$(curl -fsS --max-time 10 "$url/health" 2>/dev/null)" | grep -q spaces-computer-control; then
+      ok "$name tunnel is live and answers as control: $url"
+    elif [ "$name" = "screen" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url/embed.html")" = "200" ]; then
+      ok "$name tunnel is live and serves the screen: $url"
+    else
+      warn "$name tunnel $url answered /health with $code - it is dead or swapped"
+      printf "    quick tunnels die with the terminal that started them; re-run the launcher with --tunnel\n"
+    fi
+  done
+}
+
+cmd_doctor() {
+  printf "%sspaces doctor%s\n" "$BOLD" "$RESET"
+  check_docker || return 1
+  check_container || return 1
+  check_control || true
+  check_screen || true
+  check_key || true
+  check_image || true
+  check_tunnels || true
+  echo
+  if [ "$fails" -gt 0 ]; then
+    printf "%s%d problem(s), %s warning(s)%s\n" "$RED" "$fails" "$warns" "$RESET"
+    return 1
+  fi
+  if [ "$warns" -gt 0 ]; then
+    printf "%shealthy, with %s thing(s) to look at%s\n" "$GREEN" "$warns" "$RESET"
+    return 0
+  fi
+  printf "%sall good%s\n" "$GREEN" "$RESET"
+}
+
+cmd_status() {
+  local id running got want
+  printf "%sspaces%s  %s\n\n" "$BOLD" "$RESET" "$IMAGE_NAME"
+  id="$(container_id)"
+  if [ -n "$id" ]; then
+    running="$(running_digest)"
+    printf "  container  %s (up since %s)\n" "$CONTAINER_NAME" "$(docker inspect -f '{{.State.StartedAt}}' "$id")"
+    printf "  image      sha256:%s\n" "$running"
+    printf "  control    %s:%s   screen %s:%s\n" "127.0.0.1" "$CONTROL_PORT" "127.0.0.1" "$NO_VNC_PORT"
+    printf "  key        %s\n" "$(fingerprint "$(container_token)")"
+  else
+    printf "  container  %snot running%s\n" "$DIM" "$RESET"
+  fi
+  got="$(local_digest)"; want="$(registry_digest)"
+  printf "  local      sha256:%s\n" "${got:-none}"
+  printf "  published  sha256:%s\n" "${want:-unknown}"
+  if [ -n "$want" ] && [ "$want" != "${running:-}" ]; then
+    printf "\n  %san update is applied by:%s spaces update\n" "$YELLOW" "$RESET"
+  elif [ -n "$want" ]; then
+    printf "\n  %sup to date%s\n" "$GREEN" "$RESET"
+  fi
+}
+
+cmd_update() {
+  if ! have docker || ! docker info >/dev/null 2>&1; then
+    bad "docker is not available" "start Docker or colima first"
+    return 1
+  fi
+  local before after
+  before="$(local_digest)"
+  printf ":: pulling %s\n" "$IMAGE_NAME"
+  if ! docker pull "$IMAGE_NAME"; then
+    bad "the registry did not give us the image" "check your connection, or set COMPUTER_IMAGE to a build you have locally"
+    return 1
+  fi
+  after="$(local_digest)"
+  if [ "$before" = "$after" ]; then
+    printf "%s✓ already current%s (sha256:%s)\n" "$GREEN" "$RESET" "$after"
+    return 0
+  fi
+  printf ":: image changed sha256:%s -> sha256:%s\n" "$before" "$after"
+  if [ ! -f "$LAUNCHER" ]; then
+    printf "%s!%s no launcher at %s to recreate the container\n" "$YELLOW" "$RESET" "$LAUNCHER"
+    printf "  run it once and it is kept there, or paste the curl one-liner again\n"
+    return 1
+  fi
+  printf ":: recreating the computer with the new image (your key and files are kept)\n"
+  bash "$LAUNCHER" "$@"
+}
+
+cmd_link() {
+  local url code
+  url="$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' /tmp/spaces-tunnel-control.log 2>/dev/null | tail -1)"
+  [ -n "$url" ] || { bad "no control tunnel on this machine" "run the launcher with --tunnel"; return 1; }
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url/health")"
+  printf "control tunnel: %s (health %s)\n" "$url" "$code"
+  printf "key:            %s\n" "$(fingerprint "$(container_token 2>/dev/null)")"
+  printf "mcp:            %s/mcp\n" "$url"
+}
+
+cmd_help() {
+  cat <<EOF
+spaces - inspect, verify and update a Spaces computer
+
+  spaces doctor    check every moving part and say how to fix what fails
+  spaces status    what is actually applied: image digest, key fingerprint, ports
+  spaces update    pull the published image and recreate the computer if it changed
+  spaces link      show the control tunnel and the key it accepts
+
+  Everything here is read from the running machine, not from a config file.
+EOF
+}
+
+case "${1:-help}" in
+  doctor)  cmd_doctor ;;
+  status)  cmd_status ;;
+  update)  shift; cmd_update "$@" ;;
+  link)    cmd_link ;;
+  version|--version|-v) printf 'spaces cli 0.1\n' ;;
+  help|--help|-h) cmd_help ;;
+  *) printf "unknown command: spaces %s\n\n" "$1"; cmd_help; exit 2 ;;
+esac
