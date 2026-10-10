@@ -207,6 +207,19 @@ if ! curl -fsS --max-time 25 "${SCREEN_URL}/embed.html" >/dev/null; then
   exit 1
 fi
 
+# Ask the control server who it is before handing anything over. A link whose
+# two halves were swapped looks exactly like a bad key to whoever pastes it, and
+# the two need opposite fixes.
+if [ "$CONTROL_URL" = "$SCREEN_URL" ]; then
+  printf "%s✗ both tunnels published the same address, refusing to print a link%s\n" "$RED" "$RESET" >&2
+  exit 1
+fi
+if ! curl -fsS --max-time 15 "$CONTROL_URL/health" | grep -q spaces-computer-control; then
+  printf "%s✗ %s is not answering as the control server (it answered %s)%s\n" "$RED" "$CONTROL_URL" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$CONTROL_URL/health" || true)" "$RESET" >&2
+  printf "  the screen tunnel answers the same way, so this link would only 401. Re-run this script.\n" >&2
+  exit 1
+fi
+
 CONNECT_KEY="$(python3 -c 'import json, base64, sys; print(base64.b64encode(json.dumps({"c": sys.argv[1], "s": sys.argv[2], "t": sys.argv[3]}).encode()).decode())' "$CONTROL_URL" "${SCREEN_URL}/embed.html" "$TOKEN")"
 
 printf "\n%s✓%s tunnels active\n\n" "$GREEN" "$RESET"
